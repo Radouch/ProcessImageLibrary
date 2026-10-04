@@ -1748,10 +1748,13 @@ class ProcessImageLibrary extends Process {
 
 		$pageSize = $this->readPageSize();
 		// Picker: default to a small page on first load (no explicit, valid
-		// ?ps in the request) so the modal opens fast. The page-size picker
-		// still lets the user switch to a larger page.
+		// ?ps in the request, and no saved user pref) so the modal opens fast.
+		// A user who has set their own page-size pref gets that honoured here
+		// just like in the main view; the page-size picker still lets the user
+		// switch to a different size inside the modal.
 		if ($this->pickerMode
-			&& !in_array((int) $this->wire('input')->get('ps'), $this->getPageSizeOptions(), true)) {
+			&& !in_array((int) $this->wire('input')->get('ps'), $this->getPageSizeOptions(), true)
+			&& $this->getUserPrefs()['pageSize'] === null) {
 			$pageSize = self::PICKER_DEFAULT_PAGE_SIZE;
 		}
 
