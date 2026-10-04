@@ -42,6 +42,12 @@ trait ImageLibraryUsage {
 	 *  complete, so a large site never blocks a single request past this. */
 	const USAGE_SCAN_BUDGET_MS = 8000;
 
+	/** Per-request memo for buildImageStemIndex(). The index is derived from
+	 *  the whole-site image row set; building it more than once per request is
+	 *  pure waste. Several code paths (a save that reindexes usage, then a
+	 *  render) would otherwise rebuild it each time. null = not built yet. */
+	protected ?array $stemIndexCache = null;
+
 	/**
 	 * Create the usage table if it isn't there yet. Runs its CREATE at most
 	 * once per request (static guard) and only when an indexing path is
@@ -115,6 +121,7 @@ trait ImageLibraryUsage {
 	 * @return array<int,array<string,bool>>
 	 */
 	protected function buildImageStemIndex(): array {
+		if ($this->stemIndexCache !== null) return $this->stemIndexCache;
 		$idx = [];
 		foreach ($this->loadImageRowsAll() as $r) {
 			$pid = (int) ($r['pageId'] ?? 0);
@@ -123,6 +130,97 @@ trait ImageLibraryUsage {
 			$stem = $this->basenameStem($bn);
 			if ($stem === '') continue;
 			$idx[$pid][$stem] = true;
+		}
+		return $this->stemIndexCache = $idx;
+	}
+
+	/**
+	 * The library-file page ids a single rich-text value references: the
+	 * "/site/assets/files/<pid>/" directory id of every embed token, plus any
+	 * "-pid<id>" cross-page marker. Mirrors the candidate set extractUsageKeys
+	 * resolves against, so a stem index scoped to these ids has everything that
+	 * lookup will ask for. Pure string parsing, no DB.
+	 *
+	 * @return array<int,bool>  set of referenced page ids (id => true)
+	 */
+	protected function referencedFilePids(string $text): array {
+		$out = [];
+		if ($text === '' || strpos($text, '/') === false) return $out;
+		$filesUrl = (string) $this->wire('config')->urls->files;
+		if ($filesUrl === '' || strpos($text, $filesUrl) === false) return $out;
+		$re = '~' . preg_quote($filesUrl, '~') . '(\d+)/([^"\'\s/?#]+)~i';
+		if (!preg_match_all($re, $text, $matches, PREG_SET_ORDER)) return $out;
+		foreach ($matches as $m) {
+			$out[(int) $m[1]] = true;
+			if (preg_match('#-pid(\d+)\b#', (string) $m[2], $pm)) $out[(int) $pm[1]] = true;
+		}
+		return $out;
+	}
+
+	/**
+	 * Stem index for a SPECIFIC set of storage pages – the cheap counterpart to
+	 * buildImageStemIndex(), which loads every image row on the site. Given the
+	 * handful of pages a saved page's text references, this reads only those
+	 * pages' image-field rows straight from the field tables (indexed by
+	 * pages_id), so a normal save never triggers the whole-site enumeration.
+	 *
+	 * Kept equivalent to the full index: only non-blacklisted image fields are
+	 * read (discoverImageFields), and referenced pages are first filtered to
+	 * eligible (non-blacklisted) templates, so an embed pointing at an image on
+	 * an out-of-scope page resolves the same way it would through the full path
+	 * (i.e. not at all). Keyed by storage page id like buildImageStemIndex();
+	 * for a repeater-hosted image that is the repeater item page, which is also
+	 * the "/files/<pid>/" directory id, so no owner resolution is needed here.
+	 *
+	 * @param array<int,int> $pageIds referenced storage page ids
+	 * @return array<int,array<string,bool>>  [ storagePageId => [ stem => true ] ]
+	 */
+	protected function buildScopedStemIndex(array $pageIds): array {
+		$idx = [];
+		$pageIds = array_values(array_unique(array_filter(array_map('intval', $pageIds))));
+		if (!$pageIds) return $idx;
+
+		$imageFields = $this->discoverImageFields();
+		if (!$imageFields) return $idx;
+
+		// Eligible (non-blacklisted) template ids, to match the full index scope.
+		$eligibleIds = [];
+		foreach ($this->discoverEligibleTemplates($imageFields) as $tname) {
+			$t = $this->wire('templates')->get($tname);
+			if ($t && $t->id) $eligibleIds[(int) $t->id] = true;
+		}
+		if (!$eligibleIds) return $idx;
+
+		$db = $this->wire('database');
+		// Keep only referenced pages on an eligible template.
+		$in   = implode(',', $pageIds);
+		$keep = [];
+		try {
+			$q = $db->query("SELECT id, templates_id FROM pages WHERE id IN ($in)");
+			while (($r = $q->fetch(\PDO::FETCH_NUM)) !== false) {
+				if (isset($eligibleIds[(int) $r[1]])) $keep[(int) $r[0]] = true;
+			}
+		} catch (\Throwable $e) {
+			return $idx;
+		}
+		if (!$keep) return $idx;
+
+		$keepIn = implode(',', array_keys($keep));
+		foreach ($imageFields as $fname) {
+			$field = $this->wire('fields')->get($fname);
+			if (!$field) continue;
+			$table = $db->escapeTable($field->getTable());
+			if ($table === '') continue;
+			try {
+				$q = $db->query("SELECT pages_id, data FROM `{$table}` WHERE pages_id IN ({$keepIn})");
+			} catch (\Throwable $e) {
+				continue;   // field without its table (mid-migration) – skip
+			}
+			while (($r = $q->fetch(\PDO::FETCH_NUM)) !== false) {
+				$pid  = (int) $r[0];
+				$stem = $this->basenameStem(basename((string) $r[1]));
+				if ($stem !== '') $idx[$pid][$stem] = true;
+			}
 		}
 		return $idx;
 	}
@@ -223,18 +321,41 @@ trait ImageLibraryUsage {
 		if ($page->id && $page->template) {
 			$textareaFields = $this->discoverTextareaFields();
 			if ($textareaFields) {
-				if ($stemIndex === null) $stemIndex = $this->buildImageStemIndex();
 				$page->of(false);
+				// Read this page's textarea content once, keeping the per-field
+				// language slots, and collect every library-file page id the text
+				// references (the "/files/<pid>/" directory id plus any "-pid<id>"
+				// cross-page marker) so the stem index can be scoped to just those.
+				$texts   = [];   // [fieldName => [text, …]]
+				$refPids = [];
 				foreach ($textareaFields as $name) {
 					if (!$page->template->hasField($name)) continue;
-					$found = [];
-					foreach ($this->textareaLangValues($page, $name) as $text) {
-						foreach ($this->extractUsageKeys($text, $stemIndex) as $k => $pair) {
-							$found[$k] = $pair;   // union across language slots
+					$vals = $this->textareaLangValues($page, $name);
+					$texts[$name] = $vals;
+					foreach ($vals as $text) {
+						foreach ($this->referencedFilePids($text) as $pid => $_) {
+							$refPids[$pid] = true;
 						}
 					}
-					foreach ($found as $pair) {
-						$rows[] = [$pair[0], $pair[1], $name];
+				}
+				if ($texts) {
+					// A single save only needs to know the image stems of the
+					// pages its own text references, not the whole site. Build a
+					// stem index scoped to those pages instead of loading every
+					// image row via loadImageRowsAll(). A caller that already holds
+					// a full index (batch reindex / rename) passes it in and we
+					// reuse that instead.
+					$idx = $stemIndex ?? $this->buildScopedStemIndex(array_keys($refPids));
+					foreach ($texts as $name => $vals) {
+						$found = [];
+						foreach ($vals as $text) {
+							foreach ($this->extractUsageKeys($text, $idx) as $k => $pair) {
+								$found[$k] = $pair;   // union across language slots
+							}
+						}
+						foreach ($found as $pair) {
+							$rows[] = [$pair[0], $pair[1], $name];
+						}
 					}
 				}
 			}
@@ -272,6 +393,10 @@ trait ImageLibraryUsage {
 	protected function reindexUsageForRefPages(array $refPageIds): void {
 		$refPageIds = array_values(array_unique(array_map('intval', $refPageIds)));
 		if (!$refPageIds) return;
+		// This runs AFTER a rename cleared the row cache and must reflect the NEW
+		// basenames. Drop the per-request stem-index memo so buildImageStemIndex()
+		// rebuilds from the updated data instead of returning a pre-rename copy.
+		$this->stemIndexCache = null;
 		$stemIndex = $this->buildImageStemIndex();
 		foreach ($refPageIds as $rid) {
 			$this->reindexPageUsage($rid, $stemIndex);
