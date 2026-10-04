@@ -581,9 +581,8 @@ ProcessImageLibrary/
 
 MIT — see [LICENSE](LICENSE).
 
-## Differences from `main` (branch `dev`)
+## Differences from `main` (branch `feature/ref-resolver`)
 
-`dev` is the integration branch. It currently matches the released `main`
-(v1.1.1) exactly – there are no unreleased changes on it right now. As work
-lands here ahead of a release, this section lists what `dev` carries over
-`main`; when it is empty, the two are in sync.
+This branch is `main` (v1.1.1) plus **one** unreleased change:
+
+- **Hookable `resolvePageRef()`** – a new hookable method that produces the **“Page” column** reference for each row (page id, title, front-end URL, edit URL, name). The default reproduces current behaviour exactly (repeater/matrix owner page, otherwise the storage page), so with no hook attached nothing changes. Site code can hook it to change what the column shows and links to when the storage page isn't the page an editor should be sent to, or when its editor lives at a non-standard URL. A generic example is in the `___resolvePageRef()` doc block. Scope is deliberately the **“Page” column only** (link + title): the per-image editor modal still targets the storage page’s real image-field slot, and “Used in” (rich-text embeds) is unaffected. Known limitation: the hook resolves the *displayed* link/title; sorting and filtering still key off the storage page’s cached title.

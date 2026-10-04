@@ -6010,6 +6010,51 @@ class ProcessImageLibrary extends Process {
 	}
 
 	/**
+	 * The "Page" column reference for one table row: which page its link points
+	 * at, plus the title / front-end URL / edit URL shown for it. HOOKABLE.
+	 *
+	 * Default is the display page the module already resolved: the
+	 * repeater/matrix owner page for repeater-hosted images, otherwise the
+	 * storage page the image field lives on. Return an array with any of
+	 * pageId / title / url / editUrl / name to change what the column shows and
+	 * links to for a given row; with no hook attached the default above is used
+	 * unchanged.
+	 *
+	 * A hook is useful when the storage page is not the page an editor should be
+	 * sent to, or when its editor lives at a non-standard URL. What the right
+	 * target is remains entirely the site's decision; this method makes no
+	 * assumptions about any particular setup. Example, sending the link to a
+	 * different admin URL for pages of a given template:
+	 *
+	 *   $wire->addHookAfter('ProcessImageLibrary::resolvePageRef', function($e) {
+	 *       $storage = $e->arguments(1);              // storage page
+	 *       if ($storage->template->name !== 'my-template') return;
+	 *       $ref = $e->return;
+	 *       $ref['editUrl'] = '/path/to/editor/?id=' . $storage->id;
+	 *       $e->return = $ref;
+	 *   });
+	 *
+	 * Scope: ONLY the "Page" column (link + title). The per-image editor modal
+	 * (thumbnail click) is intentionally NOT routed through here: it edits the
+	 * real image-field slot on the storage page and must keep targeting it.
+	 * "Used in" (rich-text embeds) is unaffected.
+	 *
+	 * @param Page  $displayPage the module's resolved display page (== $storagePage unless repeater)
+	 * @param Page  $storagePage the page whose image field physically holds the file
+	 * @param array<string,mixed> $row the flat row (pageId, fieldName, basename, …)
+	 * @return array{pageId:int,title:string,url:string,editUrl:string,name:string}
+	 */
+	public function ___resolvePageRef(Page $displayPage, Page $storagePage, array $row): array {
+		return [
+			'pageId'  => (int) $displayPage->id,
+			'title'   => (string) $displayPage->title,
+			'url'     => (string) $displayPage->url,
+			'editUrl' => (string) $displayPage->editUrl,
+			'name'    => (string) $displayPage->name,
+		];
+	}
+
+	/**
 	 * Hydrate the visible row slice with thumbnail URLs and page links.
 	 *
 	 * Only this slice triggers Pageimage hydration — the bulk row list stays
@@ -6056,8 +6101,15 @@ class ProcessImageLibrary extends Process {
 			if (!empty($row['ownerPageId']) && isset($pagesById[(int) $row['ownerPageId']])) {
 				$displayPage = $pagesById[(int) $row['ownerPageId']];
 			}
-			$row['pageUrl']     = $displayPage->url;
-			$row['pageEditUrl'] = $displayPage->editUrl;
+			// Page-column reference (link target + title). Hookable
+			// (resolvePageRef) so site code can retarget the reference when the
+			// storage page isn't the right target, or reaches its editor at a
+			// non-standard URL. Default = the display page (repeater owner, else
+			// storage). The thumb-editor modal below is NOT routed through here:
+			// it deliberately still targets the storage page's real image slot.
+			$ref = $this->resolvePageRef($displayPage, $page, $row);
+			$row['pageUrl']     = (string) ($ref['url'] ?? $displayPage->url);
+			$row['pageEditUrl'] = (string) ($ref['editUrl'] ?? $displayPage->editUrl);
 			// Base URL for the per-image editor modal. It edits the STORAGE
 			// page (where the field lives — the repeater page for a repeater
 			// image), NOT the display/owner page, so use $page (not
@@ -6073,11 +6125,11 @@ class ProcessImageLibrary extends Process {
 			// the cached pageTitle is intentionally default-language
 			// (so sort / filter / search stay consistent across
 			// editors); this override flips display to user-language.
-			$row['pageTitle']   = (string) $displayPage->title;
-			// Page name (slug) for the (p) placeholder; owner-page-
-			// resolved like pageTitle so repeater rows expand to
-			// something meaningful.
-			$row['pageName']    = (string) $displayPage->name;
+			$row['pageTitle']   = (string) ($ref['title'] ?? $displayPage->title);
+			// Page name (slug) for the (p) placeholder; owner-/hook-
+			// resolved like pageTitle so repeater / retargeted rows
+			// expand to something meaningful.
+			$row['pageName']    = (string) ($ref['name'] ?? $displayPage->name);
 
 			$img = $this->resolvePageimage($page, (string) $row['fieldName'], (string) $row['basename']);
 			if (!$img) continue;
